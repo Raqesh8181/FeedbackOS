@@ -1,0 +1,129 @@
+const mysql = require("mysql2/promise");
+const { getWorkspaceId } = require('./tenantContext');
+require("dotenv").config();
+
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT,
+  waitForConnections: true,
+  connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 10),
+});
+
+// V5.3 defense-in-depth: automatically scope business-table queries to the
+// authenticated workspace. Explicit workspace predicates remain supported.
+const TENANT_TABLES = new Set([
+  'feedback','problems','actions','problem_feedback','problem_events','daily_metrics',
+  'problem_relationships','root_cause_investigations','investigation_tasks','predictive_signals',
+  'preventive_actions','strategic_themes','strategic_initiatives','initiative_problems',
+  'initiative_actions','strategy_snapshots','executive_snapshots','automation_rules',
+  'automation_queue','automation_runs','os_runs','os_decisions','os_snapshots','quality_runs','feedback_quality_flags','quality_retry_queue'
+]);
+
+function scopeQuery(sql, params) {
+  const workspaceId = getWorkspaceId();
+  if (!workspaceId || typeof sql !== 'string') return { sql, params };
+  const text = sql.trim();
+  if (/^(SHOW|DESCRIBE|EXPLAIN|SET|START|COMMIT|ROLLBACK|CREATE|ALTER|DROP|TRUNCATE)/i.test(text)) return { sql, params };
+
+  // If the caller already explicitly scopes the query, do not duplicate it.
+  if (/\bworkspace_id\b/i.test(text)) return { sql, params };
+
+  const match = text.match(/\bFROM\s+`?([a-zA-Z0-9_]+)`?(?:\s+(?:AS\s+)?`?([a-zA-Z0-9_]+)`?)?/i);
+  const insert = text.match(/^INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?/i);
+  const update = text.match(/^UPDATE\s+`?([a-zA-Z0-9_]+)`?(?:\s+(?:AS\s+)?`?([a-zA-Z0-9_]+)`?)?/i);
+  const del = text.match(/^DELETE\s+FROM\s+`?([a-zA-Z0-9_]+)`?(?:\s+(?:AS\s+)?`?([a-zA-Z0-9_]+)`?)?/i);
+
+  if (insert && TENANT_TABLES.has(insert[1])) {
+    const colMatch = text.match(/^INSERT\s+INTO\s+`?([a-zA-Z0-9_]+)`?\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i);
+    if (!colMatch) return { sql, params };
+    const cols = colMatch[2];
+    const values = colMatch[3];
+    const newSql = text.replace(colMatch[0], `INSERT INTO ${insert[1]} (${cols}, workspace_id) VALUES (${values}, ?)`);
+    return { sql: newSql, params: [...(Array.isArray(params) ? params : []), workspaceId] };
+  }
+
+  const target = (match && TENANT_TABLES.has(match[1])) ? match : ((update && TENANT_TABLES.has(update[1])) ? update : ((del && TENANT_TABLES.has(del[1])) ? del : null));
+  if (!target) return { sql, params };
+  const table = target[1];
+
+  // The FROM/UPDATE/DELETE regex may capture a SQL keyword as the
+  // apparent alias (for example FROM problems WHERE ...). Never treat
+  // SQL control keywords as table aliases.
+  const SQL_KEYWORDS = new Set([
+    'WHERE','ORDER','GROUP','HAVING','LIMIT','OFFSET',
+    'LEFT','RIGHT','INNER','OUTER','JOIN','ON',
+    'SET','VALUES','RETURNING'
+  ]);
+
+  const candidateAlias = target[2];
+  const alias = candidateAlias && !SQL_KEYWORDS.has(candidateAlias.toUpperCase())
+    ? candidateAlias
+    : table;
+
+  const condition = `${alias}.workspace_id = ?`;
+
+  if (update || del) {
+    const where = /\bWHERE\b/i.test(text);
+    return { sql: where ? `${text} AND ${condition}` : `${text} WHERE ${condition}`, params: [...(Array.isArray(params) ? params : []), workspaceId] };
+  }
+
+  // SELECT: add the scope to the outer query. This is deliberately limited to
+  // the first FROM table to avoid changing LEFT JOIN semantics.
+  //
+  // IMPORTANT: the tenant predicate must be inserted BEFORE ORDER BY / GROUP BY /
+  // HAVING / LIMIT / OFFSET. Appending it to the end of a query would produce
+  // invalid SQL such as:
+  //   LIMIT 8 AND problems.workspace_id = ?
+  const where = /\bWHERE\b/i.test(text);
+  const scopedParams = [...(Array.isArray(params) ? params : []), workspaceId];
+
+  if (where) {
+    const insertBefore = /\b(GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET)\b/i;
+    const matchBefore = text.match(insertBefore);
+
+    if (matchBefore && matchBefore.index !== undefined) {
+      const index = matchBefore.index;
+      const before = text.slice(0, index).trimEnd();
+      const after = text.slice(index);
+      return {
+        sql: `${before} AND ${condition} ${after}`,
+        params: scopedParams
+      };
+    }
+
+    return {
+      sql: `${text} AND ${condition}`,
+      params: scopedParams
+    };
+  }
+
+  const insertBefore = /\b(GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|OFFSET)\b/i;
+  const matchBefore = text.match(insertBefore);
+
+  if (matchBefore && matchBefore.index !== undefined) {
+    const index = matchBefore.index;
+    const before = text.slice(0, index).trimEnd();
+    const after = text.slice(index);
+
+    return {
+      sql: `${before} WHERE ${condition} ${after}`,
+      params: scopedParams
+    };
+  }
+
+  return {
+    sql: `${text} WHERE ${condition}`,
+    params: scopedParams
+  };
+}
+
+const originalQuery = pool.query.bind(pool);
+pool.query = function scopedQuery(sql, params) {
+  const scoped = scopeQuery(sql, params);
+  return originalQuery(scoped.sql, scoped.params);
+};
+
+module.exports = pool;

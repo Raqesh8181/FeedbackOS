@@ -1,0 +1,5 @@
+const test=require('node:test');const assert=require('node:assert/strict');const {buildCorrectionSignals,buildLearningExplanation,confidenceFromCount,normalize}=require('../services/learningLoop');
+test('V6.0 groups human corrections into learning signals',()=>{const x=buildCorrectionSignals([{field_name:'category',old_value:'billing',new_value:'payments'},{field_name:'category',old_value:'billing',new_value:'payments'},{field_name:'severity',old_value:'medium',new_value:'high'}]);assert.equal(x[0].count,2);assert.equal(x[0].to_value,'payments')});
+test('V6.0 learning explanation is explicit and governed',()=>{const text=buildLearningExplanation({field_name:'severity',from_value:'medium',to_value:'high',count:3});assert.match(text,/Human-reviewed/);assert.match(text,/not an automatic model change/)});
+test('V6.0 confidence increases with evidence but stays bounded',()=>{assert.ok(confidenceFromCount(10)>confidenceFromCount(1));assert.ok(confidenceFromCount(100000)<=0.99)});
+test('V6.0 normalization is stable',()=>assert.equal(normalize('  High   Priority '),'high priority'));
